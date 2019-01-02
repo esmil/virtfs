@@ -966,6 +966,65 @@ impl<T> VirtFS<T> {
         }
         true
     }
+
+    pub fn for_each<F, E>(&self, mut f: F) -> std::result::Result<(), E>
+            where F: FnMut(&[u8], &Node<T>) -> std::result::Result<(), E> {
+        let mut path = vec![b'/'];
+        let mut stack = vec![(b"" as &[u8], 0, path.len())];
+
+        while let Some((name, idx, len)) = stack.pop() {
+            path.truncate(len);
+            path.extend_from_slice(name);
+            let node = if let Some(Entry::Node(n)) = self.entry.get(idx) {
+                n
+            } else {
+                unreachable!();
+            };
+            f(&path, node)?;
+            if let Node::Dir(ref d) = *node {
+                if let Some(b'/') = path.last() {
+                    /* do nothing */
+                } else {
+                    path.push(b'/');
+                }
+                for (name, idx) in d.entries.iter().rev() {
+                    stack.push((name, *idx, path.len()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn for_each_mut<F, E>(&mut self, mut f: F) -> std::result::Result<(), E>
+            where F: FnMut(&[u8], &mut Node<T>) -> std::result::Result<(), E> {
+        let mut path = vec![b'/'];
+        let mut names = Vec::new();
+        let mut stack = vec![(path.len(), names.len(), 0)];
+
+        while let Some((plen, nlen, idx)) = stack.pop() {
+            path.truncate(plen);
+            path.extend_from_slice(&names[nlen..]);
+            names.truncate(nlen);
+            let node = if let Some(Entry::Node(n)) = self.entry.get_mut(idx) {
+                n
+            } else {
+                unreachable!();
+            };
+            f(&path, node)?;
+            if let Node::Dir(ref d) = *node {
+                if let Some(b'/') = path.last() {
+                    /* do nothing */
+                } else {
+                    path.push(b'/');
+                }
+                for (name, idx) in d.entries.iter().rev() {
+                    stack.push((path.len(), names.len(), *idx));
+                    names.extend_from_slice(name);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn to_str(buf: &[u8]) -> &str {
@@ -987,8 +1046,8 @@ impl<T> fmt::Display for VirtFS<T> {
                     if !path.ends_with('/') {
                         path.push('/');
                     }
-                    for (n, i) in d.entries.iter().rev() {
-                        stack.push((to_str(n), *i, path.len()));
+                    for (name, idx) in d.entries.iter().rev() {
+                        stack.push((to_str(name), *idx, path.len()));
                     }
                 }
                 Entry::Node(Node::File(ref r)) => {
@@ -1024,7 +1083,7 @@ impl<T> fmt::Display for VirtFS<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, VirtFS};
+    use super::{Node, VirtFS, to_str};
 
     #[test]
     fn new() {
@@ -1240,5 +1299,53 @@ mod tests {
         assert!(fs.hardlink(b"stays", b"a/b/c/stays").is_ok());
         assert!(fs.unlink(b"a/b").is_ok());
         assert_eq!(fs.nodes(), 3);
+    }
+
+    #[test]
+    fn for_each() {
+        let mut fs = VirtFS::<&str>::new();
+
+        assert!(fs.mkdir(b"a").is_ok());
+        assert!(fs.mkdir(b"a/b").is_ok());
+        assert!(fs.mkdir(b"a/b/c").is_ok());
+        assert!(fs.newfile(b"a/b/c/file", "xyz\n").is_ok());
+        assert!(fs.newfile(b"a/b/anotherfile", "abc\n").is_ok());
+        assert!(fs.mkdir(b"a/b/zoo").is_ok());
+        assert!(fs.newfile(b"a/b/zoo/file3", "foo\n").is_ok());
+
+        let paths: Vec<&[u8]> = vec![
+            b"/",
+            b"/a",
+            b"/a/b",
+            b"/a/b/anotherfile",
+            b"/a/b/c",
+            b"/a/b/c/file",
+            b"/a/b/zoo",
+            b"/a/b/zoo/file3",
+        ];
+        let mut idx = 0;
+        assert!(fs.for_each_mut(|path, node| {
+            println!("{} {} {}", node.uid(), node.gid(), to_str(path));
+            if path != paths[idx] {
+                return Err(());
+            }
+            idx += 1;
+            node.chown(1000).chgrp(100);
+            Ok(())
+        }).is_ok());
+
+        idx = 0;
+        assert!(fs.for_each(|path, node| {
+            println!("{} {} {}", node.uid(), node.gid(), to_str(path));
+            if path != paths[idx] {
+                return Err(());
+            }
+            idx += 1;
+            if node.uid() == 1000 && node.gid() == 100 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }).is_ok());
     }
 }
