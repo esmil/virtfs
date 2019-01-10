@@ -7,6 +7,7 @@ pub enum Error {
     InvalidTarget,
     NotFound,
     AlreadyExists,
+    InvalidXattr,
 }
 
 impl fmt::Display for Error {
@@ -16,6 +17,7 @@ impl fmt::Display for Error {
             Error::InvalidTarget => write!(f, "invalid target"),
             Error::NotFound      => write!(f, "not found"),
             Error::AlreadyExists => write!(f, "already exists"),
+            Error::InvalidXattr  => write!(f, "invalid xattr key"),
         }
     }
 }
@@ -31,6 +33,8 @@ impl From<Error> for std::io::Error {
                 std::io::ErrorKind::NotFound, "not found"),
             Error::AlreadyExists => std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists, "already exists"),
+            Error::InvalidXattr  => std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, "invalid xattr key"),
         }
     }
 }
@@ -53,6 +57,10 @@ fn file_exists<T>() -> Result<T> {
     Err(Error::AlreadyExists)
 }
 
+fn invalid_xattr<T>() -> Result<T> {
+    Err(Error::InvalidXattr)
+}
+
 pub type Index = usize;
 
 pub struct Dir {
@@ -61,6 +69,7 @@ pub struct Dir {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
     entries: BTreeMap<Box<[u8]>, Index>,
     parent: Index,
 }
@@ -87,6 +96,7 @@ pub struct File<T> {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
     pub data: T,
 }
 
@@ -102,6 +112,7 @@ pub struct Symlink {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
     tgt: Box<[u8]>,
 }
 
@@ -134,6 +145,7 @@ pub struct BlockDev {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
     pub rdev: u32,
 }
 
@@ -149,6 +161,7 @@ pub struct CharDev {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
     pub rdev: u32,
 }
 
@@ -164,6 +177,7 @@ pub struct Fifo {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
 }
 
 impl Fifo {
@@ -178,6 +192,7 @@ pub struct Socket {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    xattrs: BTreeMap<Box<[u8]>, Box<[u8]>>,
 }
 
 impl Socket {
@@ -257,6 +272,38 @@ impl<T> Node<T> {
         }
     }
 
+    fn _xattrs(&self) -> &BTreeMap<Box<[u8]>, Box<[u8]>> {
+        match *self {
+            Node::Dir(ref d)      => &d.xattrs,
+            Node::File(ref f)     => &f.xattrs,
+            Node::Symlink(ref l)  => &l.xattrs,
+            Node::CharDev(ref c)  => &c.xattrs,
+            Node::BlockDev(ref b) => &b.xattrs,
+            Node::Fifo(ref p)     => &p.xattrs,
+            Node::Socket(ref s)   => &s.xattrs,
+        }
+    }
+
+    pub fn has_xattrs(&self) -> bool {
+        !self._xattrs().is_empty()
+    }
+
+    pub fn xattrs(&self) -> impl Iterator<Item=(&[u8], &[u8])>
+            + ExactSizeIterator
+            + DoubleEndedIterator {
+        self._xattrs().iter().map(|(k,v)| (k.as_ref(), v.as_ref()))
+    }
+
+    pub fn listxattr(&self) -> impl Iterator<Item=&[u8]>
+            + ExactSizeIterator
+            + DoubleEndedIterator {
+        self._xattrs().keys().map(|k| k.as_ref())
+    }
+
+    pub fn getxattr<'a>(&'a mut self, key: &[u8]) -> Option<&'a [u8]> {
+        self._xattrs().get(key).map(|x| x.as_ref())
+    }
+
     pub fn touch(&mut self, mtime: SystemTime) -> &mut Self {
         match *self {
             Node::Dir(ref mut d)      => d.mtime = mtime,
@@ -306,6 +353,37 @@ impl<T> Node<T> {
             Node::Fifo(ref mut p)     => p.mode = mode,
             Node::Socket(ref mut s)   => s.mode = mode,
         }
+        self
+    }
+
+    fn _xattrs_mut(&mut self) -> &mut BTreeMap<Box<[u8]>, Box<[u8]>> {
+        match *self {
+            Node::Dir(ref mut d)      => &mut d.xattrs,
+            Node::File(ref mut f)     => &mut f.xattrs,
+            Node::Symlink(ref mut l)  => &mut l.xattrs,
+            Node::CharDev(ref mut c)  => &mut c.xattrs,
+            Node::BlockDev(ref mut b) => &mut b.xattrs,
+            Node::Fifo(ref mut p)     => &mut p.xattrs,
+            Node::Socket(ref mut s)   => &mut s.xattrs,
+        }
+    }
+
+    pub fn setxattr<V>(&mut self, key: &[u8], value: V) -> Result<&mut Self>
+            where V: Into<Box<[u8]>> {
+        if key.iter().any(|&x| x == 0) {
+            return invalid_xattr();
+        }
+        self._xattrs_mut().insert(key.into(), value.into());
+        Ok(self)
+    }
+
+    pub fn removexattr(&mut self, key: &[u8]) -> &mut Self {
+        self._xattrs_mut().remove(key);
+        self
+    }
+
+    pub fn clearxattrs(&mut self) -> &mut Self {
+        self._xattrs_mut().clear();
         self
     }
 
@@ -372,6 +450,7 @@ impl<T> VirtFS<T> {
                 uid: 0,
                 gid: 0,
                 mode: 0o755,
+                xattrs: Default::default(),
                 entries: BTreeMap::new(),
                 parent: 0,
             }))],
@@ -549,6 +628,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o755,
+            xattrs: Default::default(),
             entries: BTreeMap::new(),
             parent: at,
         }));
@@ -577,6 +657,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o644,
+            xattrs: Default::default(),
             data: data.into(),
         }));
         self.nodes += 1;
@@ -602,6 +683,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o777,
+            xattrs: Default::default(),
             tgt: tgt.into(),
         }));
         self.nodes += 1;
@@ -626,6 +708,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o644,
+            xattrs: Default::default(),
             rdev,
         }));
         self.nodes += 1;
@@ -650,6 +733,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o644,
+            xattrs: Default::default(),
             rdev,
         }));
         self.nodes += 1;
@@ -674,6 +758,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o644,
+            xattrs: Default::default(),
         }));
         self.nodes += 1;
         debug_assert!(self.validate());
@@ -697,6 +782,7 @@ impl<T> VirtFS<T> {
             uid: 0,
             gid: 0,
             mode: 0o644,
+            xattrs: Default::default(),
         }));
         self.nodes += 1;
         debug_assert!(self.validate());
